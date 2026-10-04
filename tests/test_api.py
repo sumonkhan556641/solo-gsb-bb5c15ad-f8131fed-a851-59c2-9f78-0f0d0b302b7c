@@ -5,7 +5,8 @@
 - 非法间隔（负数、非整数、最长等待短于最短等待）返回 400 且记录不变；
 - base_version 过期返回 409，不覆盖较新版本；
 - 版本回看/恢复保留每条关系当时的间隔设置；
-- 间隔导致的约束冲突保留输入但不得定稿。
+- 间隔导致的约束冲突保留输入但不得定稿；
+- 多路径上下界矛盾按时间窗冲突归因（不误报关系成环），网页与 API 结论一致。
 """
 import json
 import os
@@ -191,6 +192,52 @@ def test_gap_conflict_kept_but_not_finalizable():
     status, resp = req("POST", "/api/reviews/{}/finalize".format(rid),
                        {"base_version": bundle["review"]["version"]})
     assert status == 400, resp
+
+
+def test_multi_path_bound_conflict_attribution():
+    # 四个持续 0 分钟事件，A 固定 10:00，其余 10:00~12:00；
+    # A→B 最短等待 60、B→D 无额外等待、A→C 与 C→D 最长等待各 10。
+    # 关系图无有向环：推算应报告 D 的时间窗冲突（11:00 > 10:20），
+    # 不得误报为“先于”关系成环；输入保留且不得定稿。
+    status, bundle = req("POST", "/api/reviews", {"title": "多路径复盘"})
+    assert status == 201
+    rid = bundle["review"]["id"]
+    status, bundle = req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": 1, "title": "多路径复盘",
+        "events": [
+            ev("a", "A", "2026-10-01T10:00", "2026-10-01T10:00", 0),
+            ev("b", "B", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+            ev("c", "C", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+            ev("d", "D", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+        ],
+        "relations": [
+            rel("a", "b", min_g=60),
+            rel("b", "d"),
+            rel("a", "c", max_g=10),
+            rel("c", "d", max_g=10),
+        ]})
+    assert status == 200, bundle
+    res = bundle["computation"]["result"]
+    assert res["status"] == "conflict"
+    assert not any(c["type"] == "cycle" for c in res["conflicts"]), res["conflicts"]
+    win = [c for c in res["conflicts"] if c["type"] == "window"]
+    assert len(win) == 1, res["conflicts"]
+    id_by_key = {e["name"]: e["id"] for e in bundle["events"]}
+    assert win[0]["event_ids"] == [id_by_key["D"]]
+    w_d = res["windows"][str(id_by_key["D"])]
+    assert w_d["earliest_start"] == "2026-10-01T11:00"
+    assert w_d["latest_start"] == "2026-10-01T10:20"
+    assert win[0]["earliest_chain"] and win[0]["latest_chain"]
+    # 输入保留；冲突版本不得定稿
+    assert len(bundle["events"]) == 4 and len(bundle["relations"]) == 4
+    status, resp = req("POST", "/api/reviews/{}/finalize".format(rid),
+                       {"base_version": bundle["review"]["version"]})
+    assert status == 400, resp
+    # 版本回看展示同一结论（网页与 API 一致）
+    status, v2 = req("GET", "/api/reviews/{}/versions/2".format(rid))
+    assert status == 200
+    assert v2["result"]["status"] == "conflict"
+    assert not any(c["type"] == "cycle" for c in v2["result"]["conflicts"])
 
 
 def test_draft_relation_skipped_with_reason():

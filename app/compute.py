@@ -9,8 +9,16 @@
 “A 开始 + A 持续 <= B 开始”，推算结果与升级前完全一致。
 
 输出：每个完整事件的可行开始时间窗（最早/最晚可行开始）及推算依据链；
-约束冲突（窗口不可满足、关系成环）时给出冲突事件、冲突类型与双方依据链；
 缺少时间范围的事件作为“暂存”处理，其关联关系不参与推算并标明原因。
+
+约束冲突按成因归因：
+  invalid_range  输入范围自相矛盾；
+  cycle          “先于”关系构成真正不可满足的有向环（推导环全部由
+                 “最短等待”边组成，沿关系方向兜圈）；
+  window         时间窗冲突，含多路径上下界矛盾——关系图本身无有向环，
+                 但最短等待沿一条路径推出的最早界与最长等待沿另一路径推出的
+                 最晚界无法同时满足。此时按受影响事件给出由输入和各关系
+                 推出的最早、最晚界及可读依据链，不再误报为关系成环。
 """
 
 from datetime import datetime, timedelta
@@ -50,6 +58,8 @@ def compute(events, relations):
       windows           {event_id: {earliest_start, latest_start, earliest_end,
                                     latest_end, earliest_chain, latest_chain}}
       conflicts         [{type, event_ids, message, ...}]
+                         type 为 "invalid_range" | "cycle" | "window"；
+                         多路径上下界矛盾（关系图无有向环）按 "window" 报告
       drafts            [{id, name, reason}]            暂存事件（不参与推算）
       skipped_relations [{id, predecessor_id, successor_id, reason, ...}]
     """
@@ -198,8 +208,14 @@ def compute(events, relations):
             parts.append("最长等待 {} 分钟".format(m))
         return "、".join(parts)
 
-    def build_chain(start_id, kind):
-        """从结论回溯到输入依据，返回按“输入 → 结论”排列的步骤列表。"""
+    def build_chain(start_id, kind, loop_text=None):
+        """从结论回溯到输入依据，返回按“输入 → 结论”排列的步骤列表。
+
+        loop_text：回溯再次遇到已走访事件时的终止说明；缺省用于真正的
+        有向环场景，多路径上下界矛盾场景由调用方给出更准确的文案。
+        """
+        if loop_text is None:
+            loop_text = "（检测到循环依赖，回溯终止）"
         steps = []
         cur = start_id
         seen = set()
@@ -242,15 +258,94 @@ def compute(events, relations):
                         oev["name"], ev["name"], m, oev["name"], dur[other], ev["name"], _fmt(val))
             steps.append({"text": text})
             if cur in seen:
-                steps.append({"text": "（检测到循环依赖，回溯终止）"})
+                steps.append({"text": loop_text})
                 break
             seen.add(cur)
             cur = other
         steps.reverse()
         return steps
 
+    # ---- 5. 不可满足归因：真正有向环 vs 多路径上下界矛盾 -----------------
+    # 松弛发散说明约束不可满足，但发散环未必是“先于”关系的有向环：
+    #   - 发散环全部由“最短等待”边组成 ⟺ 沿关系方向兜圈，是真正的有向环；
+    #   - 环上只要有一条“最长等待”边（逆关系方向的约束），就是多路径
+    #     上下界矛盾：最短等待沿一条路径抬高最早界，最长等待沿另一条路径
+    #     压低最晚界，两者无法同时满足。此类矛盾按时间窗冲突归因。
+    report_as_cycle = False
+    cyc = []
+    safety = None  # 多路径矛盾兜底证据（矛盾环上的事件与推导链）
     if forward_cycle or backward_cycle:
-        cyc = find_cycle(est_src) or find_cycle(lst_src)
+        cyc = find_cycle(est_src)
+        cyc_src = est_src
+        if not cyc:
+            cyc = find_cycle(lst_src)
+            cyc_src = lst_src
+        if cyc and all(cyc_src[node][2] == "min" for node in cyc):
+            report_as_cycle = True
+        else:
+            # 留存矛盾环证据：若收敛子系统仍定位不到具体冲突事件，用作兜底
+            if cyc:
+                safety = {
+                    "event_ids": list(cyc),
+                    "earliest_chain": build_chain(
+                        cyc[0], "est",
+                        loop_text="（推导回到起点，上下界相互矛盾，回溯终止）"),
+                    "latest_chain": build_chain(
+                        cyc[0], "lst",
+                        loop_text="（推导回到起点，上下界相互矛盾，回溯终止）"),
+                }
+            # 用各自收敛的子系统重推边界，给出可读的最早/最晚界：
+            #   最早界：仅沿关系方向施加各关系的“最短等待”；
+            #   最晚界：仅沿关系方向施加各关系的“最长等待”。
+            # 两个子系统的边都沿关系方向，关系图无有向环时必然收敛。
+            for i in active:
+                est[i] = _parse(active[i]["earliest_start"])
+                lst[i] = _parse(active[i]["latest_start"])
+                est_src[i] = None
+                lst_src[i] = None
+
+            def relax_est_min_only():
+                changed = False
+                for r in active_relations:
+                    a, b = r["predecessor_id"], r["successor_id"]
+                    g, _m = rel_gap[r["id"]]
+                    cand = est[a] + timedelta(minutes=dur[a] + g)
+                    if cand > est[b]:
+                        est[b] = cand
+                        est_src[b] = (a, r["id"], "min")
+                        changed = True
+                return changed
+
+            def relax_lst_max_only():
+                changed = False
+                for r in active_relations:
+                    a, b = r["predecessor_id"], r["successor_id"]
+                    _g, m = rel_gap[r["id"]]
+                    if m is not None:
+                        cand = lst[a] + timedelta(minutes=dur[a] + m)
+                        if cand < lst[b]:
+                            lst[b] = cand
+                            lst_src[b] = (a, r["id"], "max")
+                            changed = True
+                return changed
+
+            converged = True
+            for _ in range(n):
+                if not relax_est_min_only():
+                    break
+            else:
+                converged = False
+            for _ in range(n):
+                if not relax_lst_max_only():
+                    break
+            else:
+                converged = False
+            if not converged:
+                # 子系统仍发散：存在正权重的有向环，按 cycle 归因
+                report_as_cycle = True
+                cyc = find_cycle(est_src) or find_cycle(lst_src)
+
+    if report_as_cycle:
         names = [active[i]["name"] for i in cyc]
         conflict = {
             "type": "cycle",
@@ -264,7 +359,7 @@ def compute(events, relations):
             conflict["latest_chain"] = build_chain(cyc[0], "lst")
         conflicts.append(conflict)
 
-    # ---- 5. 汇总每个事件的可行时间窗 ------------------------------------
+    # ---- 6. 汇总每个事件的可行时间窗 ------------------------------------
     windows = {}
     for i in active:
         windows[i] = {
@@ -276,12 +371,16 @@ def compute(events, relations):
             "latest_chain": build_chain(i, "lst"),
         }
 
-    # ---- 6. 窗口冲突（最早可行开始晚于最晚可行开始） ----------------------
-    if not (forward_cycle or backward_cycle):
+    # ---- 7. 窗口冲突（最早可行开始晚于最晚可行开始） ----------------------
+    # 多路径上下界矛盾经第 5 步重推后也在此按时间窗冲突指出受影响事件，
+    # 依据链展示由输入和各关系（最短/最长等待）推出的最早、最晚界。
+    window_conflict_found = False
+    if not report_as_cycle:
         for i in active:
             if i in invalid_range:
                 continue  # 已在输入层面报告
             if est[i] > lst[i]:
+                window_conflict_found = True
                 conflicts.append({
                     "type": "window",
                     "event_ids": [i],
@@ -290,6 +389,30 @@ def compute(events, relations):
                     "earliest_chain": windows[i]["earliest_chain"],
                     "latest_chain": windows[i]["latest_chain"],
                 })
+
+    # ---- 8. 多路径上下界矛盾兜底 ------------------------------------------
+    # 关系图无有向环但约束发散，且重推后没有单个事件的窗口被击穿
+    # （上下界矛盾体现在事件之间的相对约束上）：仍按时间窗冲突报告
+    # 矛盾环上的受影响事件，绝不可误判为“先于”关系成环，更不能漏报。
+    if (forward_cycle or backward_cycle) and not report_as_cycle \
+            and not window_conflict_found:
+        if safety is not None:
+            names = "、".join("「{}」".format(active[i]["name"]) for i in safety["event_ids"])
+            conflicts.append({
+                "type": "window",
+                "event_ids": safety["event_ids"],
+                "message": "多路径上下界矛盾：{}的可行开始由多条路径的“先于”关系与"
+                           "间隔约束共同限定，推出的上界与下界无法同时满足，约束冲突".format(names),
+                "earliest_chain": safety["earliest_chain"],
+                "latest_chain": safety["latest_chain"],
+            })
+        else:
+            conflicts.append({
+                "type": "window",
+                "event_ids": [],
+                "message": "多路径上下界矛盾：各“先于”关系与间隔约束推出的上界与下界"
+                           "无法同时满足，约束冲突",
+            })
 
     return {
         "status": "conflict" if conflicts else "ok",

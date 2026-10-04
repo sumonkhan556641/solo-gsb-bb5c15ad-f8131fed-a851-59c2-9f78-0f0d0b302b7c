@@ -193,6 +193,80 @@ def test_cycle_with_gaps_has_opposing_chains():
     assert cyc[0]["earliest_chain"] and cyc[0]["latest_chain"]
 
 
+def test_multi_path_bound_conflict_reported_as_window():
+    # 复盘场景：四个持续 0 分钟事件，A 固定 10:00，其余 10:00~12:00。
+    # A→B 最短等待 60、B→D 无额外等待、A→C 与 C→D 最长等待各 10。
+    # 关系图无有向环：D 的最早界 11:00（A→B→D 最短等待路径）与
+    # 最晚界 10:20（A→C→D 最长等待路径）矛盾，应按时间窗冲突归因，
+    # 不得误报为“先于”关系成环。
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T10:00", 0),
+        ev(2, "B", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+        ev(3, "C", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+        ev(4, "D", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+    ]
+    relations = [
+        rel_gap(1, 1, 2, min_g=60),
+        rel_gap(2, 2, 4),
+        rel_gap(3, 1, 3, max_g=10),
+        rel_gap(4, 3, 4, max_g=10),
+    ]
+    res = compute.compute(events, relations)
+    assert res["status"] == "conflict"
+    assert not any(c["type"] == "cycle" for c in res["conflicts"]), res["conflicts"]
+    win = [c for c in res["conflicts"] if c["type"] == "window"]
+    assert [c["event_ids"] for c in win] == [[4]], win
+    c4 = win[0]
+    assert "11:00" in c4["message"] and "10:20" in c4["message"]
+    # 受影响事件 D 的窗口展示由输入和各关系推出的最早、最晚界
+    w4 = res["windows"][4]
+    assert w4["earliest_start"] == "2026-10-01T11:00"
+    assert w4["latest_start"] == "2026-10-01T10:20"
+    # 依据链：最早界沿最短等待路径、最晚界沿最长等待路径，均可读
+    est_text = " ".join(s["text"] for s in c4["earliest_chain"])
+    lst_text = " ".join(s["text"] for s in c4["latest_chain"])
+    assert "最短等待 60 分钟" in est_text and "11:00" in est_text
+    assert "最长等待 10 分钟" in lst_text and "10:20" in lst_text
+    assert "输入的最早开始" in est_text and "输入的最晚开始" in lst_text
+    # 其余事件窗口不被误伤
+    assert res["windows"][2]["earliest_start"] == "2026-10-01T11:00"
+    assert res["windows"][2]["latest_start"] == "2026-10-01T12:00"
+    assert res["windows"][3]["latest_start"] == "2026-10-01T10:10"
+
+
+def test_multi_path_relative_contradiction_still_conflict():
+    # 上下界矛盾体现在事件间相对约束上（X2 ≥ X0+70 且 X2 ≤ X0+10），
+    # 没有单个事件的绝对窗口被击穿：仍须按时间窗冲突报告受影响事件，
+    # 不得误报 cycle，也不得漏报为 ok。
+    events = [
+        ev(1, "X0", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+        ev(2, "X1", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+        ev(3, "X2", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+    ]
+    relations = [
+        rel_gap(1, 1, 2, min_g=60),
+        rel_gap(2, 2, 3, min_g=10),
+        rel_gap(3, 1, 3, max_g=10),
+    ]
+    res = compute.compute(events, relations)
+    assert res["status"] == "conflict"
+    assert not any(c["type"] == "cycle" for c in res["conflicts"]), res["conflicts"]
+    win = [c for c in res["conflicts"] if c["type"] == "window"]
+    assert win and set(win[0]["event_ids"]) == {1, 2, 3}
+    assert "多路径上下界矛盾" in win[0]["message"]
+    assert win[0]["earliest_chain"] and win[0]["latest_chain"]
+
+
+def test_zero_weight_cycle_remains_feasible():
+    # 零时长零间隔的有向环是可满足的，不误报冲突
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+        ev(2, "B", "2026-10-01T10:00", "2026-10-01T12:00", 0),
+    ]
+    res = compute.compute(events, [rel(1, 1, 2), rel(2, 2, 1)])
+    assert res["status"] == "ok", res
+
+
 def test_old_relation_without_gaps_unchanged():
     # 未设置间隔的旧关系：推算与依据链文案保持旧行为
     events = [
