@@ -211,6 +211,42 @@ def test_draft_relation_skipped_with_reason():
     assert s["min_gap_minutes"] == 5
 
 
+def test_multipath_conflict_reported_as_window_not_cycle():
+    # 无环菱形关系的多路径上下界矛盾：HTTP 推算结果为 window 冲突（无 cycle），
+    # 输入保留、不得定稿、冲突带界与依据链字段。
+    status, bundle = req("POST", "/api/reviews", {"title": "多路径冲突复盘"})
+    rid = bundle["review"]["id"]
+    events = [
+        ev("a", "A", "2026-10-04T10:00", "2026-10-04T10:00", 0),
+        ev("b", "B", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+        ev("c", "C", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+        ev("d", "D", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+    ]
+    relations = [
+        rel("a", "b", min_g=60), rel("b", "d"),
+        rel("a", "c", max_g=10), rel("c", "d", max_g=10),
+    ]
+    status, bundle = req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": 1, "title": "多路径冲突复盘",
+        "events": events, "relations": relations})
+    assert status == 200, bundle
+    res = bundle["computation"]["result"]
+    assert res["status"] == "conflict"
+    assert not [c for c in res["conflicts"] if c["type"] == "cycle"], res["conflicts"]
+    # 事件按插入顺序返回，D 是第 4 个
+    d_id = str(bundle["events"][3]["id"])
+    d_conf = next(c for c in res["conflicts"]
+                  if c["type"] == "window" and str(c["event_ids"][0]) == d_id)
+    assert d_conf["earliest_bound"] == "2026-10-04T11:00"
+    assert d_conf["latest_bound"] == "2026-10-04T10:20"
+    assert d_conf["earliest_chain"] and d_conf["latest_chain"]
+    # 输入保留、不得定稿
+    assert len(bundle["events"]) == 4 and len(bundle["relations"]) == 4
+    status, resp = req("POST", "/api/reviews/{}/finalize".format(rid),
+                       {"base_version": bundle["review"]["version"]})
+    assert status == 400, resp
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

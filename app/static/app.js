@@ -229,6 +229,11 @@ function buildResultHtml(res, evByKey) {
   if (nConf > 0) {
     conflicts = `<div class="section-title">冲突明细（输入已保留）</div>` + res.conflicts.map((c) => {
       let html = `<div class="card conflict"><div class="msg">⚠ ${escapeHtml(c.message)}</div>`;
+      if (c.earliest_bound && c.latest_bound) {
+        html += `<div class="bounds">推出最早可行开始：<b>${escapeHtml(String(c.earliest_bound).replace("T", " "))}</b>` +
+          `　·　推出最晚可行开始：<b>${escapeHtml(String(c.latest_bound).replace("T", " "))}</b>` +
+          (c.bound_gap_minutes ? `　·　界相差 ${Number(c.bound_gap_minutes)} 分钟` : "") + `</div>`;
+      }
       if (c.earliest_chain) {
         html += `<details open><summary>最早可行开始的依据链</summary>${chainHtml(c.earliest_chain)}</details>`;
         html += `<details open><summary>最晚可行开始的依据链</summary>${chainHtml(c.latest_chain)}</details>`;

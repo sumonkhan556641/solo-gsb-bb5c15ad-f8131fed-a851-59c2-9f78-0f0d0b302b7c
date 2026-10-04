@@ -219,6 +219,69 @@ def test_skipped_relation_keeps_gap_info():
     assert "暂存" in s["reason"]
 
 
+def test_multipath_bounds_conflict_not_cycle():
+    # 无环关系图（菱形 A→B→D、A→C→D）：沿不同路径的上下界矛盾是时间窗冲突，
+    # 不能误报为“先于关系构成循环”。
+    events = [
+        ev(1, "A", "2026-10-04T10:00", "2026-10-04T10:00", 0),
+        ev(2, "B", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+        ev(3, "C", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+        ev(4, "D", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+    ]
+    res = compute.compute(events, [
+        rel_gap(1, 1, 2, min_g=60),   # A→B 最短等待 60
+        rel(2, 2, 4),                 # B→D 无额外等待
+        rel_gap(3, 1, 3, max_g=10),   # A→C 最长等待 10
+        rel_gap(4, 3, 4, max_g=10),   # C→D 最长等待 10
+    ])
+    assert res["status"] == "conflict"
+    assert not [c for c in res["conflicts"] if c["type"] == "cycle"], res["conflicts"]
+    win = {c["event_ids"][0]: c for c in res["conflicts"] if c["type"] == "window"}
+    # B/C/D 的可行窗口被多路径夹空（A 固定 10:00，自身不冲突）
+    assert set(win) == {2, 3, 4}, win.keys()
+    # D：A 10:00 + 最短等待 60（经 B）⇒ 最早 11:00；
+    #     A 10:00 + 最长等待 10+10（经 C）⇒ 最晚 10:20
+    d = win[4]
+    assert d["earliest_bound"] == "2026-10-04T11:00"
+    assert d["latest_bound"] == "2026-10-04T10:20"
+    assert d["bound_gap_minutes"] == 40
+    est_text = " ".join(s["text"] for s in d["earliest_chain"])
+    lst_text = " ".join(s["text"] for s in d["latest_chain"])
+    assert "最短等待 60 分钟" in est_text and "B" in est_text
+    assert "最长等待 10 分钟" in lst_text and "C" in lst_text
+    # 窗口本身与冲突中的界一致
+    assert res["windows"][4]["earliest_start"] == "2026-10-04T11:00"
+    assert res["windows"][4]["latest_start"] == "2026-10-04T10:20"
+    assert res["windows"][1]["earliest_start"] == res["windows"][1]["latest_start"] == \
+        "2026-10-04T10:00"
+
+
+def test_zero_weight_relation_cycle_is_satisfiable():
+    # 真正的有向环但环权为 0（持续/最短等待均为 0，允许同一时刻发生）：可满足，
+    # 不是 cycle 冲突（旧行为同样不报），窗口正常收敛。
+    events = [
+        ev(1, "A", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+        ev(2, "B", "2026-10-04T10:00", "2026-10-04T12:00", 0),
+    ]
+    res = compute.compute(events, [rel(1, 1, 2), rel(2, 2, 1)])
+    assert res["status"] == "ok", res["conflicts"]
+    assert res["windows"][1]["earliest_start"] == "2026-10-04T10:00"
+    assert res["windows"][2]["latest_start"] == "2026-10-04T12:00"
+
+
+def test_positive_relation_cycle_still_reported_as_cycle():
+    # 真正不可满足的有向环（环上持续时间之和为正）仍按 cycle 类型报告，
+    # 即使关系同时带最长等待也不能降级为 window。
+    events = [
+        ev(1, "A", "2026-10-04T10:00", "2026-10-04T12:00", 30),
+        ev(2, "B", "2026-10-04T10:00", "2026-10-04T12:00", 30),
+    ]
+    res = compute.compute(events, [
+        rel_gap(1, 1, 2, min_g=5), rel_gap(2, 2, 1, max_g=90)])
+    cyc = [c for c in res["conflicts"] if c["type"] == "cycle"]
+    assert cyc and set(cyc[0]["event_ids"]) == {1, 2}
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

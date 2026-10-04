@@ -113,6 +113,8 @@ ul.relations li {
 .card .window { font-family: ui-monospace, monospace; font-size: 13px; color: var(--accent); }
 .card .reason { color: var(--warn); font-size: 12px; }
 .card .msg { color: #ffb3ba; margin-bottom: 6px; }
+.card .bounds { font-size: 12px; color: var(--text); margin-bottom: 6px; }
+.card .bounds b { font-family: ui-monospace, monospace; color: var(--err); font-weight: 600; }
 details { margin-top: 6px; }
 summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .chain { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }

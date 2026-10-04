@@ -23,9 +23,16 @@
   `base_version`，版本过期沿用 409 冲突语义。冲突或暂存输入允许恢复，但仍不得定稿。
 - **旧库历史版本**：升级前只有推算结果、缺少完整输入快照的历史版本，会在版本列表中
   明确标记为「不可回看、不可恢复」，不会用当前输入冒充；老接口行为保持不变。
-- **冲突处理**：约束冲突（窗口不可满足、关系成环、输入范围自相矛盾）时保留全部输入，
-  指出冲突事件及双方依据链（正推最早可行开始与反推最晚可行开始两条相反依据链），
-  该版本**不得定稿**。
+- **冲突处理**：约束冲突分为两类，均保留全部输入、指出冲突事件及双方依据链
+  （正推最早可行开始与反推最晚可行开始两条相反依据链），该版本**不得定稿**：
+  - **时间窗冲突（`type: "window"`）**：关系图无有向环，但多条路径上的最短/最长
+    等待把同一事件的最早可行开始推到晚于最晚可行开始。冲突中给出受影响事件、
+    `earliest_bound` / `latest_bound` / `bound_gap_minutes` 及两条可读依据链。
+    **无环图的多路径上下界矛盾绝不会误报为“成环”。**
+  - **成环冲突（`type: "cycle"`）**：“先于”关系沿箭头方向构成正权有向环
+    （环上“前项持续 + 最短等待”之和为正，时间不可能倒流），约束无解；
+    环上持续与最短等待均为 0（允许同一时刻依次发生）的零权环是可满足的，不报冲突。
+  - 另有输入层面的 `invalid_range`（同一事件最早开始晚于最晚开始）。
 - **暂存事件**：缺少时间范围（或持续分钟数）的事件可暂存，其关联的“先于”关系
   暂不参与推算，并在页面上标明原因；存在暂存事件时同样不得定稿。
 - **多人协作并发控制**：基于 `reviews.version` 的乐观锁。携带旧版本号的提交会被
@@ -166,13 +173,53 @@ curl -s -X POST http://localhost:8000/api/reviews/1/versions/2/restore \
 （例如最长等待小于前项结束到后项最早开始的距离），推算状态为 `conflict`，
 冲突明细中给出冲突事件与正/反两条依据链，输入保留但不得定稿。
 
+### 多路径上下界矛盾：时间窗冲突（不再误报成环）
+
+当关系图**没有有向环**，但同一事件经由不同路径分别被最短等待（下界）与最长等待
+（上界）夹紧时，属于时间窗冲突（`type:"window"`），而**不是**成环。冲突项中
+`earliest_bound` / `latest_bound` 给出由输入与各条关系推出的最早/最晚界，
+`bound_gap_minutes` 为界相差分钟数，`earliest_chain` / `latest_chain` 分别展示
+下界（正推）与上界（反推）的可读依据链。真正沿“先于”方向构成正权有向环的情形
+仍按 `type:"cycle"` 报告。
+
+```bash
+# 四个 0 分钟完整事件：A 固定 10:00，B/C/D 起始范围 10:00~12:00
+# A→B 最短等待 60；B→D 无额外等待；A→C、C→D 最长等待各 10（关系图为无环菱形）
+curl -s -X PUT http://localhost:8000/api/reviews/1 \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 1, "title": "支付故障复盘",
+    "events": [
+      {"key":"a","name":"A 故障发生","earliest_start":"2026-10-04T10:00",
+       "latest_start":"2026-10-04T10:00","duration_minutes":0},
+      {"key":"b","name":"B 服务切换","earliest_start":"2026-10-04T10:00",
+       "latest_start":"2026-10-04T12:00","duration_minutes":0},
+      {"key":"c","name":"C 告警发出","earliest_start":"2026-10-04T10:00",
+       "latest_start":"2026-10-04T12:00","duration_minutes":0},
+      {"key":"d","name":"D 值班响应","earliest_start":"2026-10-04T10:00",
+       "latest_start":"2026-10-04T12:00","duration_minutes":0}
+    ],
+    "relations": [
+      {"predecessor_key":"a","successor_key":"b","min_gap_minutes":60},
+      {"predecessor_key":"b","successor_key":"d"},
+      {"predecessor_key":"a","successor_key":"c","max_gap_minutes":10},
+      {"predecessor_key":"c","successor_key":"d","max_gap_minutes":10}
+    ]}'
+# status = "conflict"；conflicts 全部为 window，没有 cycle：
+#   B：最早 11:00（A 10:00 + 最短等待 60，经 B）> 最晚 10:20（经 D、C 反推）
+#   C：最早 10:50（经 B→D 与 C→D 最长等待反推）> 最晚 10:10（A 10:00 + 10）
+#   D：最早 11:00（A→B 最短 60，B→D 无等待）> 最晚 10:20（A→C、C→D 各最长 10）
+# 每项含 earliest_bound/latest_bound/bound_gap_minutes(=40) 与 earliest_chain/latest_chain；
+# 原始输入照常保存为冲突版本（不得定稿）；版本回看展示同一结论，旧版本不被改写。
+# 对照：A↔B 互相“先于”且环上持续/最短等待之和为正 → 仍返回 type:"cycle"。
+```
+
 ## 目录结构
 
 ```
 app/
   server.py          HTTP 服务（标准库 http.server）、间隔设置校验
   db.py              SQLite 持久化、乐观锁、启动时建表与老库迁移
-  compute.py         时间窗推算与依据链生成（含间隔上下界传播）
+  compute.py         时间窗推算与依据链生成（间隔上下界有界传播；多路径矛盾报 window、真正正权有向环报 cycle）
   static/            浏览器单页界面（原生 HTML/JS/CSS）
 tests/test_compute.py  推算引擎单元测试
 tests/test_versions.py 版本快照/回看/恢复与旧库兼容测试
